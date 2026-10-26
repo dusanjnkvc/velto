@@ -189,6 +189,56 @@ function importSession(){
 }
 function sameSession(start){const current=importSession();return current.hosted===start.hosted&&(!start.hosted||start.authenticated&&current.authenticated&&!!start.accountId&&start.accountId===current.accountId)&&(!start.localGate||start.localAuthenticated&&current.localAuthenticated);} 
 function notify(message){if(typeof global.toast==='function')global.toast(message);}
+function makeReview(result,draft,matchedCustomer){
+ const fields={},items=draft.items.map(()=>({}));
+ const flag=(key,message,kind='uncertain')=>{fields[key]={message,kind,initial:String(draft[key]??'')}};
+ for(const [key,label] of [['number','Original invoice number'],['supplierName','Supplier name'],['customerName','Customer name'],['issueDate','Issue date'],['dueDate','Due date'],['iban','Payment IBAN']])if(!draft[key])flag(key,label+' was not found. Enter it from the PDF.','missing');
+ for(const key of ['number','supplierName','supplierAddress','customerName','customerAddress','iban'])if(draft[key])flag(key,'Check this extracted value against the original PDF.');
+ if(!result.items.length){items[0].description={message:'Enter the line description from the PDF.',kind:'missing',initial:''};items[0].unitPrice={message:'Enter the original unit price; no price was guessed.',kind:'uncertain',initial:'0'};}
+ const warningText=result.warnings.join(' ');
+ if(/total.*(?:differs|does not match|could not be confirmed)/i.test(warningText))for(let n=0;n<items.length;n++)for(const key of ['quantity','unitPrice'])items[n][key]={message:'Check this amount against the PDF total.',kind:'uncertain',initial:String(draft.items[n][key]??'')};
+ if(/VAT.*(?:could not|not.*confirmed)/i.test(warningText)){flag('supplierVatPayer','Confirm the supplier VAT status against the PDF.');for(let n=0;n<items.length;n++)items[n].vatRate={message:'Confirm the VAT rate from the PDF.',kind:'uncertain',initial:String(draft.items[n].vatRate??'')};}
+ const warnings=[...result.warnings];if(matchedCustomer)warnings.push('An existing saved customer was matched. Its saved details will be kept; the PDF details apply to this invoice.');if((dataStore()?.invoices||[]).some(invoice=>invoice.number===draft.number))warnings.push('An invoice with this number already exists. Check for a duplicate before saving.');
+ return {fields,items,warnings,fileName:result.fileName,pageCount:result.pageCount,total:result.total};
+}
+function renderReview(){
+ const draft=global.invoiceDraft,review=draft?.importReview,modal=global.document.getElementById('modal');if(!review||!modal)return;
+ global.document.getElementById('invoiceImportReview')?.remove();
+ for(const input of modal.querySelectorAll?.('input,select')||[]){input._veltoReviewAbort?.abort();if(input.getAttribute('aria-describedby')?.startsWith('review_'))input.removeAttribute('aria-describedby');}
+ for(const note of modal.querySelectorAll?.('.invoice-review-note')||[])note.remove();
+ for(const field of modal.querySelectorAll?.('.invoice-field-review')||[])field.classList.remove('invoice-field-review');
+ for(const badge of modal.querySelectorAll?.('.invoice-review-count')||[])badge.remove();
+ const notice=global.document.createElement('section');notice.id='invoiceImportReview';notice.className='invoice-import-review';notice.setAttribute?.('aria-label','Imported PDF review');
+ const title=global.document.createElement('b');title.textContent='Imported PDF — review before saving';notice.append(title);
+ const intro=global.document.createElement('p');intro.textContent='Nothing has been saved. Check highlighted fields against the original PDF. Correct them or mark an extracted value as checked.';notice.append(intro);
+ if(review.total!==null){const amount=global.document.createElement('p');amount.textContent='Total read from PDF: '+global.iMoney(review.total);notice.append(amount);}
+ if(review.warnings.length){const list=global.document.createElement('ul');for(const warning of review.warnings){const row=global.document.createElement('li');row.textContent=warning;list.append(row);}notice.append(list);}
+ const count=global.document.createElement('p');count.setAttribute?.('aria-live','polite');notice.append(count);
+ const editor=modal.querySelector('.invoice-editor');if(editor?.prepend)editor.prepend(notice);else editor?.before(notice);
+ let pending=0;const sections=new Map();
+ function decorate(id,flags,key){
+  const info=flags[key],input=global.document.getElementById(id);if(!info||!input||!input.closest)return;
+  const value=input.type==='checkbox'?String(input.checked):input.value;
+  if((info.kind==='missing'&&String(value).trim())||(info.kind==='uncertain'&&String(value)!==info.initial)){delete flags[key];return;}
+  const field=input.closest('.field')||input.closest('.invoice-checkbox');if(!field)return;pending++;field.classList.add('invoice-field-review');
+  const note=global.document.createElement('span');note.className='invoice-review-note';note.id='review_'+id;const label=global.document.createElement('span');label.textContent=(info.kind==='missing'?'Missing: ':'Review: ')+info.message;note.append(label);input.setAttribute('aria-describedby',note.id);
+  const section=input.closest('[data-invoice-section]');if(section){sections.set(section,(sections.get(section)||0)+1);if(!global.invoiceEditorState?.reviewOpened){section.open=true;}}
+  const requiresValue=/^iv_(?:number|supplierName|customerName|issueDate|dueDate|iban)$|^ii_d\d+$/.test(id);
+  const clear=()=>{if(!flags[key]||(requiresValue&&!String(input.value).trim()))return;delete flags[key];input.removeAttribute('aria-describedby');field.classList.remove('invoice-field-review');note.remove();pending--;count.textContent=pending?pending+' highlighted fields still need checking.':'Highlighted fields checked. Review the total, then save.';if(section){const badge=section.querySelector('.invoice-review-count');if(badge){const left=Math.max(0,Number(badge.dataset.count)-1);badge.dataset.count=String(left);badge.textContent=left+' to check';if(!left)badge.remove();}}};
+  const controller=new AbortController();input._veltoReviewAbort=controller;
+  const changed=()=>{if(!flags[key])return;if(requiresValue&&!String(input.value).trim()){info.kind='missing';info.message='Enter this value from the original PDF.';label.textContent='Missing: '+info.message;note.querySelector('button')?.remove();return;}if(info.kind!=='missing'||String(input.value).trim())clear();};
+  input.addEventListener('input',changed,{signal:controller.signal});
+  input.addEventListener('change',changed,{signal:controller.signal});
+  if(info.kind!=='missing'){const button=global.document.createElement('button');button.type='button';button.textContent='Mark checked';button.setAttribute('aria-label','Mark '+(global.document.querySelector('label[for="'+id+'"]')?.textContent||'this field')+' as checked');button.addEventListener('click',clear,{once:true});note.append(button);}
+  field.append(note);
+ }
+ for(const key of Object.keys(review.fields))decorate('iv_'+key,review.fields,key);
+ for(let n=0;n<review.items.length;n++)for(const [key,prefix] of [['description','d'],['quantity','q'],['unitPrice','p'],['vatRate','v']])decorate('ii_'+prefix+n,review.items[n],key);
+ for(const [section,total] of sections){const badge=global.document.createElement('span');badge.className='invoice-review-count';badge.dataset.count=String(total);badge.textContent=total+' to check';const summary=section.querySelector('summary');if(summary)summary.insertBefore(badge,summary.querySelector('.invoice-section-chevron'));}
+ if(global.invoiceEditorState)global.invoiceEditorState.reviewOpened=true;
+ count.textContent=pending?pending+' highlighted fields still need checking.':'Highlighted fields checked. Review the total, then save.';
+ const heading=modal.querySelector('.modalhead h2');if(heading)heading.textContent='Review old invoice'+(draft.number?' - '+draft.number:'');
+}
 function openImported(result,session=importSession()){
  if(!sameSession(session)){notify('Sign in again, then import the PDF.');return false;}
  if(overlayOpen()){notify('Finish or cancel the current entry before importing an invoice.');return false;}
@@ -197,19 +247,12 @@ function openImported(result,session=importSession()){
  Object.assign(draft,{number:'',issueDate:'',deliveryDate:'',dueDate:'',orderNumber:'',iban:'',swift:'',variableSymbol:'',constantSymbol:'',paymentMethod:'',paymentTerms:'',lateInterest:'',footer:'',customerId:'',supplierVatPayer:false,vatPayer:false,status:'draft',items:[]},result.fields);
  draft.vatPayer=!!draft.supplierVatPayer;draft.items=result.items.length?structuredClone(result.items):[{description:'',quantity:1,unitPrice:0,vatRate:0}];
  const matchedCustomer=typeof global.iFindImportedCustomer==='function'?global.iFindImportedCustomer(draft):null;if(matchedCustomer)draft.customerId=matchedCustomer.id;
- global.invoiceDraft=draft;global.invoiceModal('',false,true);
+ draft.importReview=makeReview(result,draft,matchedCustomer);global.invoiceImportDraftId=draft.id;global.invoiceDraft=draft;global.invoiceModal('',false,true);
  const modal=global.document.getElementById('modal');if(!modal)return true;
- const heading=modal.querySelector('.modalhead h2');if(heading)heading.textContent='Review old invoice'+(draft.number?' - '+draft.number:'');
  if(!(dataStore()?.invoices||[]).some(invoice=>invoice.id===draft.id))modal.querySelector('.invoice-modal-actions .btn.danger')?.remove();
- const notice=global.document.createElement('section');notice.id='invoiceImportReview';notice.className='card';notice.style.cssText='margin:0 0 18px;padding:15px;border-color:var(--blue);box-shadow:none';
- const title=global.document.createElement('b');title.textContent='Imported PDF - review before saving';notice.append(title);
- const intro=global.document.createElement('p');intro.className='card-sub';intro.textContent='No changes have been saved. Check the original number, dates, company details, items and total, then save the invoice.';notice.append(intro);
- if(result.total!==null){const amount=global.document.createElement('p');amount.textContent='Total read from PDF: '+global.iMoney(result.total);notice.append(amount);}
- const warnings=[...result.warnings];if(matchedCustomer)warnings.push('An existing saved customer was matched. Its saved details will be kept; the PDF details apply to this invoice.');if((dataStore()?.invoices||[]).some(invoice=>invoice.number===draft.number))warnings.push('An invoice with this number already exists. Check for a duplicate before saving.');
- if(warnings.length){const list=global.document.createElement('ul');for(const warning of warnings){const row=global.document.createElement('li');row.textContent=warning;row.style.marginBottom='5px';list.append(row);}notice.append(list);}
- const details=global.document.createElement('details'),summary=global.document.createElement('summary'),extracted=global.document.createElement('pre');summary.textContent='Show extracted PDF text';extracted.textContent=result.text.slice(0,200000);extracted.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto;font:12px/1.5 monospace';details.append(summary,extracted);notice.append(details);
  const due=global.document.getElementById('iv_dueDate');if(due&&draft.dueDate)due.dataset.manual='1';
- modal.querySelector('.invoice-editor')?.before(notice);global.invoiceImportDraftId=draft.id;
+ // invoiceModal normally renders the review. The fallback also supports standalone importer hosts.
+ if(!global.document.getElementById('invoiceImportReview'))renderReview();
  return true;
 }
 async function importFile(file){
@@ -243,5 +286,5 @@ function picker(){
  input.addEventListener('change',()=>{const file=input.files?.[0];input.remove();if(file)importFile(file);},{once:true});input.addEventListener('cancel',()=>input.remove(),{once:true});input.click();
 }
 global.VeltoInvoiceImport={parsePages,parseNumber,parseDate,buildLines,openImported};
-global.invoiceImportOld=picker;global.invoiceImportFile=importFile;
+global.invoiceImportRenderReview=renderReview;global.invoiceImportOld=picker;global.invoiceImportFile=importFile;
 })(typeof window!=='undefined'?window:globalThis);
