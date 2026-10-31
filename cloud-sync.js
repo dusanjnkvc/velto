@@ -6,7 +6,7 @@ function initialState(){return {phase:'disconnected',message:'Connect Dropbox to
 let state=initialState();
 const clone=v=>JSON.parse(JSON.stringify(v));
 function stable(v){if(Array.isArray(v))return '['+v.map(stable).join(',')+']';if(v&&typeof v==='object')return '{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+stable(v[k])).join(',')+'}';return JSON.stringify(v)}
-function status(){return {...state}}
+function status(){return {...state,syncing:!!job}}
 function emit(phase,message){state.phase=phase;state.message=message;bridge?.onStatus?.(status())}
 function access(){const a=bridge?.getAccess?.();return a&&a.token&&a.accountId&&a.exp>Date.now()+10000&&SCOPES.every(s=>a.scopes?.includes(s))?a:null}
 function safeData(data){if(!data||typeof data!=='object'||Array.isArray(data))throw Error('The Dropbox data is not a Velto backup.');for(const key of ['transactions','invoices','invoiceCustomers','accounts','recurring'])if(!Array.isArray(data[key]))throw Error('The Dropbox data has an invalid '+key+' field.');if(!Number.isFinite(data.savingsBalance)||data.savingsBalance<0)throw Error('The Dropbox savings balance is invalid.');for(const key of ['transactions','invoices','invoiceCustomers','recurring']){const ids=new Set();for(const record of data[key]){if(!record||typeof record!=='object'||Array.isArray(record)||typeof record.id!=='string'||!/^[A-Za-z0-9:_-]{1,160}$/.test(record.id)||ids.has(record.id))throw Error('The Dropbox '+key+' contains invalid or duplicate record IDs.');ids.add(record.id)}}if(data.goals!==undefined&&!Array.isArray(data.goals))throw Error('The Dropbox savings data is invalid.');for(const key of ['invoiceSettings','invoiceProfile'])if(!data[key]||typeof data[key]!=='object'||Array.isArray(data[key]))throw Error('The Dropbox '+key+' field is invalid.');const result=clone(data);delete result.__proto__;delete result.constructor;delete result.prototype;return result}
@@ -129,7 +129,7 @@ async function connected(force=false){
   if(!remote)return choose(null,local,n,'bootstrap');
   if(android()&&hadConfirmedCache){
    if(stable(local)===stable(remote.data))return finishClean(remote.data,remote.rev,n);
-   if(dirty){if(baseRev&&remote.rev===baseRev)return pushPrepared(safeData(local),remote.rev,n);return choose(remote,safeData(local),n,'conflict')}
+   if(dirty){if(baseRev&&remote.rev===baseRev||baseRev&&snapshot?.rev===baseRev&&stable(snapshot.data)===stable(remote.data))return pushPrepared(safeData(local),remote.rev,n);return choose(remote,safeData(local),n,'conflict')}
    if(bridge.isEditing?.()){state.rev=baseRev;state.ready=true;state.bound=true;state.offline=true;emit('offline','Saved on device. Finish the current entry to check Dropbox changes.');return false}
    return finishClean(remote.data,remote.rev,n);
   }
@@ -158,7 +158,7 @@ async function flush(){
  }catch(error){await report(error,n);throw error}finally{if(n===epoch)job=null}})();return job;
 }
 async function pull(explicit=true){
- if(job)return false;if(!state.bound)return explicit?connected():false;
+ if(job)return false;if(!explicit&&['conflict','paused'].includes(state.phase))return false;if(!state.bound)return explicit?connected():false;
  if(android()&&state.offline){if(bridge.isEditing?.()&&!explicit)return false;return connected()}
  if(!access()){if(android()){await report(Object.assign(Error('Reconnect Dropbox to synchronize.'),{status:401}));if(explicit)bridge.requireAccess?.();return false}emit('auth','Reconnect Dropbox to synchronize.');if(explicit)bridge.requireAccess?.();return false}
  if(!explicit&&(state.dirty||bridge.isEditing?.()))return false;
